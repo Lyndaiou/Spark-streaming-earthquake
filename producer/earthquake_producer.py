@@ -6,6 +6,7 @@ Structured Streaming le consomme en mode file-source.
 Ecriture atomique: on ecrit <file>.tmp puis os.replace(...) vers le nom
 final. Spark n'indexe donc que des fichiers complets.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,22 +38,30 @@ INITIAL_LOOKBACK_DAYS = int(os.environ.get("INITIAL_LOOKBACK_DAYS", "7"))
 
 
 def _parse_feature(feature: dict) -> dict:
-    """Parse une feature GeoJSON USGS en dictionnaire normalisé.
-
-    TODO: Compléter cette fonction
-    - Extrayez les propriétés (properties) et les coordonnées (geometry.coordinates)
-    - Convertissez le timestamp en ISO format
-    - Retournez un dictionnaire avec les clés : event_id, magnitude, mag_type, place,
-      event_time, latitude, longitude, depth_km, significance, tsunami, status, type,
-      title, ingested_at
-
-    Indices:
-    - feature["properties"] contient les données principales
-    - feature["geometry"]["coordinates"] = [lon, lat, depth_km]
-    - feature["id"] ou properties["code"] = event_id
-    - timestamp en ms dans properties["time"] -> convertir en ISO
-    """
-    raise NotImplementedError("À implémenter")
+    props = feature.get("properties", {}) or {}
+    coords = (feature.get("geometry", {}) or {}).get("coordinates", [None, None, None])
+    ts_ms = props.get("time")
+    ts_iso = (
+        datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+        if ts_ms
+        else None
+    )
+    return {
+        "event_id": props.get("code") or feature.get("id", "unknown"),
+        "magnitude": props.get("mag"),
+        "mag_type": props.get("magType", "ml"),
+        "place": props.get("place", ""),
+        "event_time": ts_iso,
+        "latitude": coords[1] if len(coords) > 1 else None,
+        "longitude": coords[0] if len(coords) > 0 else None,
+        "depth_km": coords[2] if len(coords) > 2 else None,
+        "significance": props.get("sig") or 0,
+        "tsunami": props.get("tsunami") or 0,
+        "status": props.get("status", ""),
+        "type": props.get("type", "earthquake"),
+        "title": props.get("title", ""),
+        "ingested_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
 
 
 def _write_atomic(rows: list[dict], tag: str) -> Path:
@@ -67,8 +76,13 @@ def _write_atomic(rows: list[dict], tag: str) -> Path:
 
 
 def run() -> None:
-    logging.info("Producer started. Polling %s every %ds (window=%ds). Output -> %s",
-                 USGS_API_URL, POLL_INTERVAL, POLL_WINDOW_SECONDS, INCOMING_DIR)
+    logging.info(
+        "Producer started. Polling %s every %ds (window=%ds). Output -> %s",
+        USGS_API_URL,
+        POLL_INTERVAL,
+        POLL_WINDOW_SECONDS,
+        INCOMING_DIR,
+    )
 
     # Au premier poll, on regarde loin en arriere (INITIAL_LOOKBACK_DAYS)
     # pour avoir des donnees immediatement. Ensuite, POLL_WINDOW_SECONDS.
@@ -86,11 +100,11 @@ def run() -> None:
             resp = requests.get(
                 USGS_API_URL,
                 params={
-                    "format":       "geojson",
-                    "starttime":    window_start.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "endtime":      now.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "format": "geojson",
+                    "starttime": window_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "endtime": now.strftime("%Y-%m-%dT%H:%M:%S"),
                     "minmagnitude": MIN_MAGNITUDE,
-                    "orderby":      "time",
+                    "orderby": "time",
                 },
                 timeout=15,
             )
