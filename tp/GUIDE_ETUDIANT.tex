@@ -1,0 +1,678 @@
+\documentclass[12pt, a4paper]{article}
+
+\usepackage[french]{babel}
+\usepackage[utf-8]{inputenc}
+\usepackage[left=2cm, right=2cm, top=2cm, bottom=2cm]{geometry}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tcolorbox}
+
+% Configuration listings
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!10},
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{orange},
+  showstringspaces=false,
+  language=bash,
+  morekeywords={docker, docker-compose}
+}
+
+% Configuration hyperref
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue
+}
+
+% En-tête et pied de page
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\textit{Séance 9 - Spark Structured Streaming}}
+\fancyhead[R]{\thepage}
+\fancyfoot[C]{\textit{Guide étudiant — earthquake\_streaming}}
+
+\title{%
+  \textbf{Spark Structured Streaming en Temps Réel} \\
+  \vspace{0.5cm}
+  \large Projet : Pipeline Tremblements de Terre (USGS) \\
+  \vspace{0.3cm}
+  \normalsize Séance 9 — Apache Spark
+}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+\newpage
+
+% ======================================================================
+\section{Contexte et Objectifs}
+% ======================================================================
+
+Ce TP vous guide pour construire et exécuter un \textbf{pipeline temps réel} en trois couches :
+
+\begin{enumerate}
+  \item \textbf{Producer} — Interroge l'API USGS toutes les 30 secondes et produit des fichiers JSON.
+  \item \textbf{Spark Structured Streaming} — Consomme les fichiers, enrichit les événements, écrit sur deux sinks en parallèle.
+  \item \textbf{Orchestration} — Airflow déclenche et valide le pipeline.
+\end{enumerate}
+
+\subsection{Données}
+Les données proviennent de l'API publique USGS (Earthquake Hazards Program) :
+\begin{itemize}
+  \item URL : \texttt{https://earthquake.usgs.gov/fdsnws/event/1/query}
+  \item Format : GeoJSON
+  \item Filtre : tremblements de magnitude $\geq 2.5$
+  \item Fréquence : mise à jour toutes les 30 secondes
+\end{itemize}
+
+\subsection{Résultats attendus}
+À la fin du TP, vous aurez :
+\begin{itemize}
+  \item Des fichiers \textbf{Parquet partitionnés} par date (stockage froid).
+  \item Une table \textbf{PostgreSQL} avec tremblements enrichis (analytique).
+  \item Un \textbf{DAG Airflow} orchestrant le tout.
+\end{itemize}
+
+% ======================================================================
+\section{Architecture Générale}
+% ======================================================================
+
+\subsection{Flux de données}
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={rectangle, draw, minimum width=3cm, minimum height=0.8cm, text centered},
+  arrow/.style={->, thick},
+  label/.style={font=\small, text width=3cm, text centered}
+]
+
+% Boxes
+\node[box] (usgs) at (0, 4) {USGS API};
+\node[box] (producer) at (0, 2.5) {Producer \\ (Python)};
+\node[box] (jsonl) at (0, 0.8) {/data/incoming \\ (JSONL files)};
+\node[box] (spark) at (3, 2.5) {Spark Structured \\ Streaming};
+\node[box] (parquet) at (5, 4) {Parquet \\ /data/clean/earthquakes};
+\node[box] (postgres) at (5, 1) {PostgreSQL \\ earthquake\_enriched};
+
+% Arrows
+\draw[arrow] (usgs) -- (producer) node[midway, right] {poll 30s};
+\draw[arrow] (producer) -- (jsonl) node[midway, right] {write atomic};
+\draw[arrow] (jsonl) -- (spark) node[midway, above] {readStream};
+\draw[arrow] (spark) -- (parquet) node[midway, above] {writeStream};
+\draw[arrow] (spark) -- (postgres) node[midway, below] {foreachBatch};
+
+\end{tikzpicture}
+\end{center}
+
+\subsection{Stack Docker}
+
+Le projet fournit une composition Docker complète :
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|l|l|}
+\toprule
+\textbf{Service} & \textbf{Image} & \textbf{Rôle} \\
+\midrule
+\texttt{data-init} & busybox & Crée les dossiers partagés \\
+\texttt{postgres} & postgres:15 & Metadata + analytique \\
+\texttt{spark-master} & bde2020/spark:3.3.0 & Master Standalone \\
+\texttt{spark-worker} & bde2020/spark:3.3.0 & Worker (2 cores, 2 Go RAM) \\
+\texttt{earthquake-producer} & python:3.11-slim & Producer USGS \\
+\texttt{airflow-webserver} & custom & UI Airflow \\
+\texttt{airflow-scheduler} & custom & Scheduler + driver Spark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Tous les services partagent un volume Docker nommé \texttt{eq\_data} qui sert de « bus » entre le producer (producteur de fichiers) et Spark (consommateur).
+
+% ======================================================================
+\section{Composants Détaillés}
+% ======================================================================
+
+\subsection{Producer — \texttt{producer/earthquake\_producer.py}}
+
+Le producer est une boucle infinie qui :
+
+\begin{enumerate}
+  \item Interroge l'API USGS avec une fenêtre glissante de 1 heure (par défaut).
+  \item Déduplique les événements déjà vus (variable \texttt{seen\_ids}).
+  \item Écrit atomiquement dans \texttt{/data/incoming/eq\_<YYYYMMDDTHHMMSS>.json}.
+\end{enumerate}
+
+\subsubsection{Écriture atomique}
+
+\begin{tcolorbox}[colback=yellow!5, title=Astuce clé]
+  \textbf{Spark file source indexe les fichiers dès qu'ils apparaissent.} \\
+  Sans écriture atomique, le producer pourrait laisser un fichier partiellement écrit. Spark le lirait → crash.
+\end{tcolorbox}
+
+Le code écrit d'abord dans \texttt{eq\_<ts>.json.tmp}, puis utilise \texttt{os.replace()} pour renommer :
+
+\begin{lstlisting}[language=python, caption=Écriture atomique]
+with tmp.open("w", encoding="utf-8") as f:
+    for row in rows:
+        f.write(json.dumps(row) + "\n")
+os.replace(tmp, final)  # atomic rename
+\end{lstlisting}
+
+\subsubsection{Format JSONL produit}
+
+Chaque ligne du fichier est un événement sérialisé :
+
+\begin{lstlisting}[language=json]
+{"event_id": "us7000nabc", "magnitude": 4.2, "mag_type": "ml",
+ "place": "10 km NW of Tokyo, Japan", "event_time": "2026-04-14T08:15:23+00:00",
+ "latitude": 35.68, "longitude": 139.69, "depth_km": 12.3,
+ "significance": 272, "tsunami": 0, "status": "reviewed",
+ "type": "earthquake", "title": "M 4.2 - 10 km NW of Tokyo",
+ "ingested_at": "2026-04-14T08:16:00+00:00"}
+\end{lstlisting}
+
+\subsection{Job Spark — \texttt{spark\_jobs/earthquake\_streaming.py}}
+
+\subsubsection{Lecture (readStream)}
+
+\begin{lstlisting}[language=python, caption=Lecture streaming]
+spark.readStream \
+    .schema(EVENT_SCHEMA) \
+    .option("maxFilesPerTrigger", 5) \
+    .json(INCOMING_DIR)
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{schema} explicite : plus rapide que l'inférence, robuste aux fichiers mal formés.
+  \item \texttt{maxFilesPerTrigger=5} : chaque trigger traite au maximum 5 fichiers.
+  \item Trigger par défaut : toutes les 10 secondes.
+\end{itemize}
+
+\subsubsection{Enrichissement}
+
+Quatre colonnes sont ajoutées à chaque événement :
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|l|}
+\toprule
+\textbf{Colonne} & \textbf{Règle} \\
+\midrule
+\texttt{depth\_category} & $<70$ km = Superficiel, $<300$ = Intermédiaire, sinon Profond \\
+\texttt{severity} & tsunami=1 → TSUNAMI, mag $\geq 8$ → Dévastateur, etc. \\
+\texttt{is\_significant} & 1 si \texttt{significance} $> 500$, sinon 0 \\
+\texttt{event\_date} & Date formatée pour partitionnement \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Deux sinks en parallèle}
+
+Le job écrit sur \textbf{deux cibles différentes} via un seul \texttt{foreachBatch} :
+
+\begin{enumerate}
+  \item \textbf{Parquet} : partitionné par \texttt{event\_date}, stockage froid.
+  \item \textbf{PostgreSQL} : table \texttt{earthquake\_enriched}, analytique.
+\end{enumerate}
+
+\begin{tcolorbox}[colback=yellow!5, title=Important]
+  \textbf{Ne pas utiliser deux \texttt{writeStream} distincts !} \\
+  Ils partageraient le sourceLog et causeraient : \texttt{IllegalStateException: Concurrent update to the log}.
+\end{tcolorbox}
+
+\subsection{DAG Airflow — \texttt{dags/earthquake\_streaming\_dag.py}}
+
+La DAG a quatre tâches :
+
+\begin{lstlisting}
+health_check --> init_postgres --> +-> submit_spark_streaming (long-running)
+                                   |
+                                   +-> validate_run (check apres 3 min)
+\end{lstlisting}
+
+\subsubsection{health\_check (BashOperator)}
+
+Vérifie que les trois dossiers partagés existent et sont accessibles :
+
+\begin{lstlisting}[language=bash]
+mkdir -p /data/incoming /data/clean/earthquakes /data/checkpoints/earthquake
+ls -ld /data/incoming /data/clean/earthquakes /data/checkpoints/earthquake
+\end{lstlisting}
+
+\subsubsection{init\_postgres (PostgresOperator)}
+
+Crée la table de destination (idempotente) :
+
+\begin{lstlisting}[language=sql]
+CREATE TABLE IF NOT EXISTS earthquake_enriched (
+    event_id       TEXT PRIMARY KEY,
+    magnitude      DOUBLE PRECISION,
+    ...
+    processed_at   TIMESTAMPTZ
+);
+\end{lstlisting}
+
+\subsubsection{submit\_spark\_streaming (SparkSubmitOperator)}
+
+Lance le job Spark en mode client. Le driver s'exécute dans Airflow, les executors sur le worker Spark.
+
+\textbf{Important :} cette tâche est long-running et reste en état \texttt{running} tant que le job Spark tourne.
+
+\subsubsection{validate\_run (PythonOperator)}
+
+En parallèle de \texttt{submit\_spark\_streaming}, cette tâche :
+\begin{enumerate}
+  \item Attend 3 minutes (le temps d'un producer poll + un trigger Spark).
+  \item Compte les lignes en PostgreSQL et les fichiers Parquet.
+  \item Log un rapport de validation.
+  \item Échoue si zéro lignes ET zéro fichiers (pipeline non productif).
+\end{enumerate}
+
+% ======================================================================
+\section{Démarrage Étape par Étape}
+% ======================================================================
+
+\subsection{Prérequis}
+
+\begin{itemize}
+  \item Docker et docker-compose installés.
+  \item Au minimum 8 Go de RAM disponibles (4 pour Spark + 2 pour Airflow + 2 pour Postgres).
+  \item Connexion Internet (le producer interroge l'API USGS).
+\end{itemize}
+
+\subsection{Étape 1 : Construire les images Docker}
+
+Allez dans le dossier \texttt{infra/} :
+
+\begin{lstlisting}
+cd infra/
+docker compose build
+\end{lstlisting}
+
+Cela construit l'image personnalisée \texttt{Dockerfile.airflow} qui inclut PySpark et le driver JDBC PostgreSQL.
+
+Durée attendue : 2--3 minutes.
+
+\subsection{Étape 2 : Démarrer la stack}
+
+\begin{lstlisting}
+docker compose up -d
+\end{lstlisting}
+
+Les conteneurs démarrent dans cet ordre (via \texttt{depends\_on}) :
+\begin{enumerate}
+  \item \texttt{data-init} crée les dossiers, puis termine.
+  \item \texttt{postgres} démarre.
+  \item \texttt{spark-master} et \texttt{spark-worker} démarrent en parallèle.
+  \item \texttt{earthquake-producer} démarre et entre sa boucle infinie.
+  \item \texttt{airflow-init} migre la base, puis termine.
+  \item \texttt{airflow-webserver} et \texttt{airflow-scheduler} démarrent.
+\end{enumerate}
+
+Vérifiez l'état :
+
+\begin{lstlisting}
+docker compose ps
+\end{lstlisting}
+
+Attendez que tous les services soient \texttt{running} et \texttt{healthy}.
+
+\subsection{Étape 3 : Vérifier que le producer produit}
+
+\begin{lstlisting}
+docker compose logs -f earthquake-producer | head -20
+\end{lstlisting}
+
+Vous devriez voir des logs comme :
+
+\begin{lstlisting}
+2026-04-14 08:15:34,123 [INFO] Fetched 147 features (08:13:00 -> 08:15:34)
+- 42 new, 105 already seen
+2026-04-14 08:15:34,456 [INFO] Wrote 42 new rows ->
+/data/incoming/eq_20260414T081534.json
+\end{lstlisting}
+
+Vérifiez les fichiers :
+
+\begin{lstlisting}
+docker exec -it eq-spark-worker ls -lh /data/incoming/ | head -5
+\end{lstlisting}
+
+Vous devriez voir plusieurs fichiers \texttt{eq\_*.json}.
+
+\subsection{Étape 4 : Accéder à Airflow}
+
+Ouvrez votre navigateur à \texttt{http://localhost:8085}.
+
+Login : \texttt{admin} / \texttt{admin}
+
+Vous devriez voir le DAG \texttt{EARTHQUAKE-STREAMING} dans la liste.
+
+\subsection{Étape 5 : Déclencher le DAG}
+
+Cliquez sur le DAG, puis sur \texttt{Trigger DAG}.
+
+Le scheduler crée un \texttt{dag\_run} et exécute les tâches.
+
+Attendez que :
+\begin{itemize}
+  \item \texttt{health\_check} soit \texttt{success}.
+  \item \texttt{init\_postgres} soit \texttt{success}.
+  \item \texttt{submit\_spark\_streaming} passe à \texttt{running}.
+  \item \texttt{validate\_run} commence à s'exécuter (elle attend 3 min).
+\end{itemize}
+
+\subsection{Étape 6 : Attendre la validation}
+
+Attendez 3--4 minutes. \texttt{validate\_run} va :
+\begin{enumerate}
+  \item Interroger PostgreSQL.
+  \item Compter les fichiers Parquet.
+  \item Afficher un rapport.
+\end{enumerate}
+
+Consultez les logs de la tâche dans Airflow pour confirmer le rapport.
+
+% ======================================================================
+\section{Vérifier les Résultats}
+% ======================================================================
+
+\subsection{1. Vérifier le producer}
+
+\begin{lstlisting}[caption=Consulter les logs du producer]
+docker compose logs --tail 50 earthquake-producer
+\end{lstlisting}
+
+Cherchez des lignes comme :
+
+\begin{lstlisting}
+[INFO] Wrote 42 new rows -> /data/incoming/eq_20260414T081534.json
+\end{lstlisting}
+
+\begin{lstlisting}[caption=Lister les fichiers produits]
+docker exec -it eq-spark-worker ls -lh /data/incoming/
+\end{lstlisting}
+
+\subsection{2. Vérifier Parquet}
+
+\begin{lstlisting}[caption=Lister la structure de Parquet]
+docker exec -it eq-spark-worker ls -R /data/clean/earthquakes/
+\end{lstlisting}
+
+Vous devriez voir une structure comme :
+
+\begin{lstlisting}
+/data/clean/earthquakes/
+event_date=2026-04-14/
+  part-00000-xyz.parquet
+event_date=2026-04-13/
+  part-00000-abc.parquet
+\end{lstlisting}
+
+\begin{lstlisting}[caption=Lire les données Parquet avec Spark]
+docker exec -it eq-spark-worker spark-shell --master local[*] \
+    -e "spark.read.parquet(\"/data/clean/earthquakes\").show(10, false)"
+\end{lstlisting}
+
+\subsection{3. Vérifier PostgreSQL}
+
+\begin{lstlisting}[caption=Se connecter à PostgreSQL]
+docker exec -it eq-postgres psql -U airflow -d earthquakes
+\end{lstlisting}
+
+Puis exécutez :
+
+\begin{lstlisting}[language=sql]
+-- Top 10 événements récents
+SELECT event_id, magnitude, place, severity, processed_at
+FROM earthquake_enriched
+ORDER BY event_ts DESC LIMIT 10;
+
+-- Distribution par sévérité
+SELECT severity, COUNT(*), ROUND(AVG(magnitude)::numeric, 2) AS avg_mag
+FROM earthquake_enriched
+GROUP BY severity
+ORDER BY severity DESC;
+\end{lstlisting}
+
+\subsection{4. Spark UI}
+
+Accédez à \texttt{http://localhost:8080} pour voir la Spark Master UI.
+
+Cliquez sur l'application \texttt{earthquake-structured-streaming}, puis allez dans l'onglet \textbf{Structured Streaming} pour voir :
+\begin{itemize}
+  \item Input rate (lignes/seconde lues).
+  \item Processing rate (lignes/seconde traitées).
+  \item Latence des micro-batches.
+\end{itemize}
+
+% ======================================================================
+\section{Variables d'Environnement (Tuning)}
+% ======================================================================
+
+Toutes ces variables peuvent être modifiées dans \texttt{infra/.env.airflow} avant de lancer \texttt{docker compose up} :
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|l|l|}
+\toprule
+\textbf{Variable} & \textbf{Défaut} & \textbf{Description} \\
+\midrule
+\texttt{POLL\_INTERVAL} & 30 & Secondes entre deux polls USGS \\
+\texttt{MIN\_MAGNITUDE} & 2.5 & Magnitude minimale (filtre USGS) \\
+\texttt{INITIAL\_LOOKBACK\_DAYS} & 7 & Lookback au premier poll \\
+\texttt{POLL\_WINDOW\_SECONDS} & 3600 & Fenêtre glissante en secondes \\
+\midrule
+\texttt{INCOMING\_DIR} & /data/incoming & Répertoire producer \\
+\texttt{CLEAN\_DIR} & /data/clean/earthquakes & Répertoire Parquet \\
+\texttt{CHECKPOINT\_ROOT} & /data/checkpoints/earthquake & Répertoire checkpoints \\
+\midrule
+\texttt{PG\_URL} & jdbc:postgresql://postgres:5432/earthquakes & URL JDBC \\
+\texttt{PG\_USER} & airflow & User Postgres \\
+\texttt{PG\_PASSWORD} & airflow & Password Postgres \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Exemple : Augmenter la fréquence de traitement}
+
+\begin{lstlisting}[caption=Éditer .env.airflow, language=bash]
+# Réduire le poll interval a 15 secondes
+POLL_INTERVAL=15
+
+# Augmenter le trigger Spark: editer spark_jobs/earthquake_streaming.py
+# trigger(processingTime="5 seconds")  # au lieu de 10
+\end{lstlisting}
+
+Puis redémarrer :
+
+\begin{lstlisting}
+docker compose down
+docker compose up -d
+\end{lstlisting}
+
+% ======================================================================
+\section{Points Techniques Notables}
+% ======================================================================
+
+\subsection{Concurrence sur le FileStreamSource}
+
+\begin{tcolorbox}[colback=red!5, title=Piège courant]
+  \textbf{Ne jamais utiliser deux \texttt{writeStream} sur la même source !}
+
+  Ils partagent un sourceLog interne. Chacun essaie de mettre à jour les offsets → race condition → crash.
+
+  \textit{Solution :} utiliser un seul \texttt{writeStream} avec \texttt{foreachBatch} pour écrire sur plusieurs cibles.
+\end{tcolorbox}
+
+\subsection{Permissions cross-UID sur volume Docker}
+
+\begin{tcolorbox}[colback=orange!5, title=Détail d'implémentation]
+  Le producer tourne en uid 0 (root) dans \texttt{spark-worker}. Airflow tourne en uid 50000 dans \texttt{airflow-scheduler}. Spark Structured Streaming crée des répertoires temporaires lors du commit → problème de droits.
+
+  \textit{Corrections :}
+  \begin{itemize}
+    \item OS-level : \texttt{umask 000} avant lancer spark-master/worker.
+    \item Hadoop-level : \texttt{spark.hadoop.fs.permissions.umask-mode=000} en config Spark.
+  \end{itemize}
+\end{tcolorbox}
+
+\subsection{Checkpoints séparés pour chaque sink}
+
+\begin{tcolorbox}[colback=blue!5, title=Bonne pratique]
+  Chaque query (même si elles partagent une source) doit avoir son propre checkpoint.
+
+  Ici : \texttt{/data/checkpoints/earthquake/combined} est utilisé pour le foreachBatch.
+
+  Si vous aviez deux writeStream historiquement, vous auriez \texttt{/data/checkpoints/earthquake/parquet} et \texttt{/data/checkpoints/earthquake/postgres}. \textbf{Ne jamais les mutualiser.}
+\end{tcolorbox}
+
+\subsection{Déduplication côté producer}
+
+Le producer maintient \texttt{seen\_ids} en mémoire. Entre deux redémarrages du producer, cette set est perdue. Donc, si le producer est redémarré et repolled avec la même fenêtre, il peut re-produire des événements.
+
+\textit{Mitigation en Postgres :} la table a une PK sur \texttt{event\_id} et Spark utilise \texttt{ON CONFLICT DO NOTHING} → les doublons sont ignorés.
+
+% ======================================================================
+\section{Dépannage}
+% ======================================================================
+
+\subsection{« Producer n'écrit rien »}
+
+\begin{lstlisting}
+docker compose logs earthquake-producer | tail -30
+\end{lstlisting}
+
+Cherchez \texttt{RequestException} ou \texttt{timeout}. Vérifiez votre connexion Internet. L'API USGS peut être lente.
+
+\textit{Solution :} augmenter \texttt{timeout=15} dans \texttt{producer/earthquake\_producer.py} si le réseau est lent.
+
+\subsection{« Spark n'écrit rien »}
+
+\begin{lstlisting}
+docker compose logs airflow-scheduler | tail -50
+\end{lstlisting}
+
+Cherchez \texttt{ERROR} ou \texttt{Exception}. Vérifiez :
+\begin{itemize}
+  \item Les dossiers \texttt{/data/incoming}, \texttt{/data/clean/earthquakes}, \texttt{/data/checkpoints/earthquake} existent-ils ?
+  \item \texttt{health\_check} est-elle passée ?
+  \item Spark peut-il lire les fichiers JSONL : vérifiez le schéma.
+\end{itemize}
+
+\subsection{« Postgres est vide »}
+
+\begin{lstlisting}
+docker exec -it eq-postgres psql -U airflow -d earthquakes \
+    -c "SELECT COUNT(*) FROM earthquake_enriched;"
+\end{lstlisting}
+
+Si zéro lignes :
+\begin{itemize}
+  \item Vérifiez \texttt{validate\_run} : a-t-elle échoué ou attendu ?
+  \item Vérifiez les logs du job Spark pour les erreurs JDBC.
+  \item Testez la connexion JDBC manuellement.
+\end{itemize}
+
+\subsection{« Airflow : tâche stuck en running »}
+
+\texttt{submit\_spark\_streaming} est censée rester en \texttt{running} (c'est une query long-running Spark).
+
+Pour \textbf{arrêter proprement} le DAG :
+\begin{enumerate}
+  \item Dans l'UI Airflow, cliquez sur \texttt{submit\_spark\_streaming} → \texttt{Terminate}.
+  \item Ou : \texttt{docker compose down} (arrête tous les conteneurs).
+\end{enumerate}
+
+\subsection{« Volume Docker ne se monte pas »}
+
+\begin{lstlisting}
+docker compose down -v
+docker compose up -d
+\end{lstlisting}
+
+Cela réinitialise les volumes. \texttt{data-init} recrée les dossiers.
+
+% ======================================================================
+\section{Arrêt et Reset}
+% ======================================================================
+
+\subsection{Arrêt propre (garde les données)}
+
+\begin{lstlisting}
+cd infra/
+docker compose down
+\end{lstlisting}
+
+Les checkpoints, fichiers Parquet, et données Postgres sont \textbf{préservés}. Vous pouvez relancer \texttt{docker compose up -d} et Spark reprendra \emph{exactly-once} où il s'était arrêté.
+
+\subsection{Réinitialisation complète}
+
+\begin{lstlisting}
+cd infra/
+docker compose down -v
+\end{lstlisting}
+
+Cela supprime \textbf{tous les volumes} (\texttt{eq\_data}, \texttt{eq\_postgres\_data}, \texttt{eq\_airflow\_logs}). À partir de maintenant, tout repart de zéro.
+
+\subsection{Rebuild et redémarrage}
+
+Si vous modifiez un fichier Python (\texttt{producer}, job Spark, DAG), redémarrez comme suit :
+
+\begin{lstlisting}
+docker compose down
+docker compose build
+docker compose up -d
+\end{lstlisting}
+
+% ======================================================================
+\section{Extensions Possibles}
+% ======================================================================
+
+Une fois que vous maîtrisez le pipeline, vous pouvez expérimenter :
+
+\begin{enumerate}
+  \item \textbf{Kafka au lieu de file source} : remplacer \texttt{readStream.json(INCOMING\_DIR)} par \texttt{readStream.format("kafka")}.
+  \item \textbf{Alertes en temps réel} : ajouter une query pour déterminer les événements « significatifs » et les pousser vers une queue externe.
+  \item \textbf{Prédictions ML} : charger un modèle scikit-learn ou MLlib, scorer chaque événement.
+  \item \textbf{Backfill} : relancer le job avec une lookback de plusieurs mois pour re-traiter l'historique.
+\end{enumerate}
+
+% ======================================================================
+\section{Conclusion}
+% ======================================================================
+
+Ce TP illustre les concepts clés de \textbf{Spark Structured Streaming} :
+
+\begin{itemize}
+  \item \textbf{readStream} sur une source.
+  \item \textbf{Enrichissement} et calculs stateful.
+  \item \textbf{Deux sinks} simultanés (Parquet + Postgres).
+  \item \textbf{Checkpoints} pour la tolérance aux pannes.
+  \item \textbf{Orchestration} via Airflow.
+\end{itemize}
+
+Le pattern « file source » est simplifié (pas de Kafka), idéal pour pédagogie. En production, vous remplaceriez par Kafka pour la durabilité et la scalabilité.
+
+\vspace{1cm}
+
+\textit{Bon apprentissage !}
+
+\end{document}

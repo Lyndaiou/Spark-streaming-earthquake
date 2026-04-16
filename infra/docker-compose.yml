@@ -1,0 +1,196 @@
+services:
+
+  data-init:
+    image: busybox:1.36
+    container_name: eq-data-init
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /data/incoming /data/clean/earthquakes /data/checkpoints/earthquake && \
+        chown -R 50000:0 /data && \
+        chmod -R g+rwX /data
+    volumes:
+      - eq_data:/data
+    networks:
+      - eq-net
+
+  postgres:
+    image: postgres:15
+    container_name: eq-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    # Publie sur 5433 cote hote pour eviter le conflit avec un Postgres
+    # systeme deja en ecoute sur 5432 (macOS Homebrew / Postgres.app).
+    # Depuis les autres conteneurs, on garde "postgres:5432" via le reseau.
+    ports:
+      - "5433:5432"
+    volumes:
+      - eq_postgres_data:/var/lib/postgresql/data
+      - ../postgres_job/init-postgres.sql:/docker-entrypoint-initdb.d/init-postgres.sql:ro
+    networks:
+      - eq-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  earthquake-producer:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        RUN pip install --no-cache-dir requests==2.31.0
+    container_name: eq-producer
+    restart: unless-stopped
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    environment:
+      INCOMING_DIR: "/data/incoming"
+      MIN_MAGNITUDE: "2.5"
+      POLL_INTERVAL: "30"
+      INITIAL_LOOKBACK_DAYS: "7"
+    volumes:
+      - ../producer:/app:ro
+      - eq_data:/data
+    command: python /app/earthquake_producer.py
+    networks:
+      - eq-net
+
+  spark-master:
+    image: bde2020/spark-master:3.3.0-hadoop3.3
+    platform: linux/amd64
+    container_name: eq-spark-master
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_PUBLIC_DNS: localhost
+    # umask 000: les dirs/fichiers crees par le master (root) sur le volume
+    # partage restent writable par le driver spark-submit (uid 50000 dans
+    # airflow-scheduler) — sinon rename _temporary/... -> final echoue.
+    command: ["/bin/bash", "-c", "umask 000 && /bin/bash /master.sh"]
+    volumes:
+      - "../spark_jobs:/opt/airflow/spark_jobs:ro"
+      - eq_data:/data
+    networks:
+      - eq-net
+
+  spark-worker:
+    image: bde2020/spark-worker:3.3.0-hadoop3.3
+    platform: linux/amd64
+    container_name: eq-spark-worker
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_WEBUI_PORT: 8081
+      SPARK_PUBLIC_DNS: localhost
+    # Idem spark-master: umask 000 pour que les fichiers ecrits par les
+    # executors sur le volume partage soient renommables par le driver.
+    command: ["/bin/bash", "-c", "umask 000 && /bin/bash /worker.sh"]
+    depends_on:
+      - spark-master
+    volumes:
+      - "../spark_jobs:/opt/airflow/spark_jobs:ro"
+      - eq_data:/data
+    networks:
+      - eq-net
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: eq-airflow-init
+    restart: "no"
+    env_file: .env.airflow
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate && \
+        airflow users create --username admin --firstname Admin --lastname User \
+          --role Admin --email admin@example.com --password admin || true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
+    volumes:
+      - ../dags:/opt/airflow/dags:ro
+      - ../spark_jobs:/opt/airflow/spark_jobs:ro
+      - ../postgres_job:/opt/airflow/postgres_job:ro
+      - eq_airflow_logs:/opt/airflow/logs
+      - eq_data:/data
+    networks:
+      - eq-net
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: eq-airflow-web
+    restart: unless-stopped
+    env_file: .env.airflow
+    ports:
+      - "8085:8080"
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    volumes:
+      - ../dags:/opt/airflow/dags:ro
+      - ../spark_jobs:/opt/airflow/spark_jobs:ro
+      - ../postgres_job:/opt/airflow/postgres_job:ro
+      - eq_airflow_logs:/opt/airflow/logs
+      - eq_data:/data
+    networks:
+      - eq-net
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: eq-airflow-scheduler
+    restart: unless-stopped
+    env_file: .env.airflow
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-webserver:
+        condition: service_healthy
+    volumes:
+      - ../dags:/opt/airflow/dags:ro
+      - ../spark_jobs:/opt/airflow/spark_jobs:ro
+      - ../postgres_job:/opt/airflow/postgres_job:ro
+      - eq_airflow_logs:/opt/airflow/logs
+      - eq_data:/data
+    networks:
+      - eq-net
+
+volumes:
+  eq_postgres_data:
+  eq_airflow_logs:
+  eq_data:
+
+networks:
+  eq-net:
+    driver: bridge
