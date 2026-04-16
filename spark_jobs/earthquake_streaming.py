@@ -25,6 +25,7 @@ mettre a jour, ce qui crashe la stream avec:
     IllegalStateException: Concurrent update to the log.
     Multiple streaming jobs detected for N
 """
+
 from __future__ import annotations
 
 import os
@@ -50,85 +51,88 @@ PG_TABLE = os.environ.get("PG_TABLE", "earthquake_enriched")
 PG_STAGING_TABLE = f"{PG_TABLE}_stg"
 
 EVENT_SCHEMA = StructType([
-    StructField("event_id",     StringType()),
-    StructField("magnitude",    DoubleType()),
-    StructField("mag_type",     StringType()),
-    StructField("place",        StringType()),
-    StructField("event_time",   StringType()),
-    StructField("latitude",     DoubleType()),
-    StructField("longitude",    DoubleType()),
-    StructField("depth_km",     DoubleType()),
+    StructField("event_id", StringType()),
+    StructField("magnitude", DoubleType()),
+    StructField("mag_type", StringType()),
+    StructField("place", StringType()),
+    StructField("event_time", StringType()),
+    StructField("latitude", DoubleType()),
+    StructField("longitude", DoubleType()),
+    StructField("depth_km", DoubleType()),
     StructField("significance", IntegerType()),
-    StructField("tsunami",      IntegerType()),
-    StructField("status",       StringType()),
-    StructField("type",         StringType()),
-    StructField("title",        StringType()),
-    StructField("ingested_at",  StringType()),
+    StructField("tsunami", IntegerType()),
+    StructField("status", StringType()),
+    StructField("type", StringType()),
+    StructField("title", StringType()),
+    StructField("ingested_at", StringType()),
 ])
 
 
 def build_spark() -> SparkSession:
-    return (SparkSession.builder
+    return (
+        SparkSession.builder
         .appName("earthquake-structured-streaming")
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "4")
-        .getOrCreate())
+        .getOrCreate()
+    )
 
 
 def read_incoming(spark: SparkSession) -> DataFrame:
-    return (spark.readStream
+    return (
+        spark.readStream
         .schema(EVENT_SCHEMA)
         .option("maxFilesPerTrigger", 5)
         .option("cleanSource", "off")
-        .json(INCOMING_DIR))
+        .json(INCOMING_DIR)
+    )
 
 
 def enrich(events: DataFrame) -> DataFrame:
-    """Enrichir les événements avec des colonnes calculées.
-
-    TODO: Compléter cette fonction pour ajouter les colonnes :
-
-    1. depth_category (STRING)
-       - "Superficiel (0-70 km)"     si depth_km < 70
-       - "Intermediaire (70-300 km)" si 70 <= depth_km < 300
-       - "Profond (300+ km)"         sinon
-       Indice: utiliser F.when()...when()...otherwise()
-
-    2. severity (STRING)
-       - "TSUNAMI"       si tsunami == 1
-       - "Devastateur"   si magnitude >= 8.0
-       - "Majeur"        si magnitude >= 7.0
-       - "Fort"          si magnitude >= 6.0
-       - "Modere"        si magnitude >= 5.0
-       - "Mineur"        sinon
-       Indice: imbrication de F.when()
-
-    3. is_significant (INTEGER: 0 ou 1)
-       - 1 si significance > 500, sinon 0
-       Indice: utiliser (F.col("significance") > 500).cast("int")
-
-    4. event_ts (TIMESTAMP)
-       - Convertir la colonne event_time (STRING) en TIMESTAMP
-       Indice: F.to_timestamp()
-
-    5. event_date (DATE)
-       - Extraire la date de event_ts (pour le partitionnement)
-       Indice: F.to_date()
-
-    6. processed_at (TIMESTAMP)
-       - Timestamp du moment du traitement
-       Indice: F.current_timestamp()
-
-    Retour: événements enrichis avec toutes les colonnes précédentes + les 6 nouvelles
-    """
-    raise NotImplementedError("À implémenter")
+    return (
+        events
+        .withColumn(
+            "depth_category",
+            F
+            .when(F.col("depth_km") < 70, F.lit("Superficiel (0-70 km)"))
+            .when(F.col("depth_km") < 300, F.lit("Intermediaire (70-300 km)"))
+            .otherwise(F.lit("Profond (300+ km)")),
+        )
+        .withColumn(
+            "severity",
+            F
+            .when(F.col("tsunami") == 1, F.lit("TSUNAMI"))
+            .when(F.col("magnitude") >= 8.0, F.lit("Devastateur"))
+            .when(F.col("magnitude") >= 7.0, F.lit("Majeur"))
+            .when(F.col("magnitude") >= 6.0, F.lit("Fort"))
+            .when(F.col("magnitude") >= 5.0, F.lit("Modere"))
+            .otherwise(F.lit("Mineur")),
+        )
+        .withColumn("is_significant", (F.col("significance") > 500).cast("int"))
+        .withColumn("event_ts", F.to_timestamp("event_time"))
+        .withColumn("event_date", F.to_date("event_ts"))
+        .withColumn("processed_at", F.current_timestamp())
+    )
 
 
 UPSERT_COLUMNS = [
-    "event_id", "magnitude", "mag_type", "place", "event_ts",
-    "latitude", "longitude", "depth_km", "significance", "tsunami",
-    "status", "type", "title", "depth_category", "severity",
-    "is_significant", "processed_at",
+    "event_id",
+    "magnitude",
+    "mag_type",
+    "place",
+    "event_ts",
+    "latitude",
+    "longitude",
+    "depth_km",
+    "significance",
+    "tsunami",
+    "status",
+    "type",
+    "title",
+    "depth_category",
+    "severity",
+    "is_significant",
+    "processed_at",
 ]
 
 
@@ -177,20 +181,17 @@ def write_both(df: DataFrame):
     Ne PAS appeler batch_df.rdd.* ici: cloudpickle 2.0 bundled avec
     pyspark 3.3.0 n'est pas compatible avec le bytecode de Python 3.11.
     """
+
     def _batch(batch_df: DataFrame, batch_id: int) -> None:
         del batch_id
         batch_df.persist()
         try:
-            (batch_df
-                .write
-                .mode("append")
-                .partitionBy("event_date")
-                .parquet(CLEAN_DIR))
+            (batch_df.write.mode("append").partitionBy("event_date").parquet(CLEAN_DIR))
 
-            (batch_df
+            (
+                batch_df
                 .select(*UPSERT_COLUMNS)
-                .write
-                .format("jdbc")
+                .write.format("jdbc")
                 .option("url", PG_URL)
                 .option("dbtable", PG_STAGING_TABLE)
                 .option("user", PG_USER)
@@ -198,19 +199,22 @@ def write_both(df: DataFrame):
                 .option("driver", "org.postgresql.Driver")
                 .mode("overwrite")
                 .option("truncate", "true")
-                .save())
+                .save()
+            )
 
             _merge_staging_into_main(batch_df.sparkSession)
         finally:
             batch_df.unpersist()
 
-    return (df.writeStream
+    return (
+        df.writeStream
         .foreachBatch(_batch)
         .option("checkpointLocation", f"{CHECKPOINT_ROOT}/combined")
         .outputMode("append")
         .trigger(processingTime="10 seconds")
         .queryName("sink-combined")
-        .start())
+        .start()
+    )
 
 
 def main() -> None:
